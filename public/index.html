@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>CS:DOOM ONLINE</title>
+    <style>
+        body { background: #111; margin: 0; overflow: hidden; font-family: 'Courier New', monospace; user-select: none; }
+        #game-container { position: relative; width: 100vw; height: 100vh; }
+        canvas { display: block; width: 100%; height: 100%; image-rendering: pixelated; }
+        
+        /* UI Elements */
+        #ui { position: absolute; bottom: 30px; left: 30px; right: 30px; display: flex; justify-content: space-between; font-size: 32px; font-weight: bold; text-shadow: 2px 2px #000; pointer-events: none; color: #fff; z-index: 5; }
+        #crosshair { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); pointer-events: none; width: 20px; height: 20px; z-index: 6; }
+        .ch-line { position: absolute; background: #0f0; }
+        .ch-h { width: 20px; height: 2px; top: 9px; left: 0px; }
+        .ch-v { width: 2px; height: 20px; top: 0px; left: 9px; }
+        
+        #msg { position: absolute; top: 40%; width: 100%; text-align: center; color: white; font-size: 20px; font-weight: bold; pointer-events: none; display: none;}
+    </style>
+</head>
+<body>
+    <div id="game-container">
+        <canvas id="canvas"></canvas>
+        <div id="msg">YOU DIED - PRESS R TO RESPAWN</div>
+        
+        <div id="crosshair">
+            <div class="ch-line ch-h"></div>
+            <div class="ch-line ch-v"></div>
+        </div>
+
+        <div id="ui">
+            <div style="color: #ff4444;">HP: <span id="hp">100</span></div>
+            <div id="team">TEAM</div>
+        </div>
+    </div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+const socket = io(); 
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d', { alpha: false });
+
+// --- ASSETS ---
+const TEX_SIZE = 64;
+const textures = {};
+
+// Generate Wall Texture
+function createWallTexture() {
+    const c = document.createElement('canvas');
+    c.width = TEX_SIZE; c.height = TEX_SIZE;
+    const x = c.getContext('2d');
+    x.fillStyle = '#7a7a7a'; x.fillRect(0,0,TEX_SIZE,TEX_SIZE);
+    x.fillStyle = '#555';
+    for(let i=0; i<4; i++) {
+        let y = i * 16; let offset = (i%2) * 16;
+        x.fillRect(0, y, TEX_SIZE, 2); 
+        for(let j=0; j<4; j++) x.fillRect(j*32 + offset, y, 2, 16);
+    }
+    textures['wall'] = c;
+}
+createWallTexture();
+
+const gunImg = new Image(); gunImg.src = 'gun.png';
+const tImg = new Image();   tImg.src = 'T.png';
+const ctImg = new Image();  ctImg.src = 'CT.png';
+
+// --- GAME STATE ---
+let players = {};
+let lastPlayers = {}; 
+let projectiles = [];
+let particles = []; 
+let map = [];
+let myId = null;
+
+// --- INPUT ---
+const keys = { w: false, s: false, a: false, d: false };
+let localDir = 1.5;
+let gunRecoil = 0;
+
+socket.on('connect', () => { myId = socket.id; });
+
+socket.on('state', (state) => {
+    // Blood Logic
+    for(let id in state.players) {
+        let p = state.players[id];
+        let old = lastPlayers[id];
+        if(old && p.hp < old.hp) {
+            for(let i=0; i<15; i++) {
+                particles.push({
+                    x: p.x, y: p.y, z: 0.5,
+                    vx: (Math.random()-0.5)*0.1, vy: (Math.random()-0.5)*0.1, vz: Math.random()*0.05,
+                    life: 1.0, color: '#aa0000' 
+                });
+            }
+        }
+    }
+    lastPlayers = JSON.parse(JSON.stringify(state.players)); 
+    players = state.players;
+    projectiles = state.projectiles;
+    if(map.length === 0) map = state.map;
+});
+
+// --- CONTROLS ---
+window.onkeydown = e => {
+    keys[e.key.toLowerCase()] = true;
+    if(e.key.toLowerCase() === 'r') socket.emit('respawn');
+};
+window.onkeyup = e => keys[e.key.toLowerCase()] = false;
+document.onmousemove = e => { if(document.pointerLockElement) localDir += e.movementX * 0.002; }
+canvas.onmousedown = () => {
+    if(!document.pointerLockElement) canvas.requestPointerLock();
+    else { socket.emit('shoot'); gunRecoil = 20; }
+}
+
+// --- RENDER LOOP ---
+function draw() {
+    requestAnimationFrame(draw);
+    if(myId) socket.emit('input', { keys, dir: localDir });
+
+    // Setup Canvas
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+    const W = canvas.width; const H = canvas.height;
+
+    // Background
+    ctx.fillStyle = "#333"; ctx.fillRect(0,0,W,H/2);
+    ctx.fillStyle = "#222"; ctx.fillRect(0,H/2,W,H/2);
+
+    if(!myId || !players[myId]) return;
+    const me = players[myId];
+
+    // UI Updates
+    document.getElementById('hp').innerText = Math.floor(me.hp);
+    document.getElementById('team').innerText = me.team;
+    document.getElementById('team').style.color = me.team === 'CT' ? '#0af' : '#f00';
+    if(me.dead) {
+        ctx.fillStyle = "rgba(255,0,0,0.5)"; ctx.fillRect(0,0,W,H);
+        document.getElementById('msg').style.display = 'block'; return;
+    } else document.getElementById('msg').style.display = 'none';
+
+    // --- RAYCASTING ---
+    const ZBuffer = new Array(W).fill(0);
+    for(let x=0; x<W; x+=2) {
+        let angle = (localDir - 0.6) + (x/W)*1.2;
+        let c = Math.cos(angle), s = Math.sin(angle);
+        let d = 0, hit = false, side = 0;
+        let mapX = Math.floor(me.x), mapY = Math.floor(me.y);
+        let deltaX = Math.abs(1/c), deltaY = Math.abs(1/s);
+        let stepX, stepY, sideX, sideY;
+
+        if (c < 0) { stepX = -1; sideX = (me.x - mapX) * deltaX; }
+        else       { stepX = 1; sideX = (mapX + 1.0 - me.x) * deltaX; }
+        if (s < 0) { stepY = -1; sideY = (me.y - mapY) * deltaY; }
+        else       { stepY = 1; sideY = (mapY + 1.0 - me.y) * deltaY; }
+
+        while(!hit && d < 20) {
+            if(sideX < sideY) { sideX += deltaX; mapX += stepX; side = 0; }
+            else              { sideY += deltaY; mapY += stepY; side = 1; }
+            if(mapY<0||mapY>=24||mapX<0||mapX>=24) hit=true;
+            else if(map[mapY][mapX]>0) hit=true;
+        }
+        
+        if (side === 0) d = (mapX - me.x + (1 - stepX) / 2) / c;
+        else            d = (mapY - me.y + (1 - stepY) / 2) / s;
+
+        let realD = d * Math.cos(angle-localDir);
+        ZBuffer[x] = realD; ZBuffer[x+1] = realD;
+
+        if(hit) {
+            let h = H / realD;
+            let wallX;
+            if (side === 0) wallX = me.y + d * s; else wallX = me.x + d * c;
+            wallX -= Math.floor(wallX);
+            let texX = Math.floor(wallX * TEX_SIZE);
+            ctx.drawImage(textures['wall'], texX, 0, 1, TEX_SIZE, x, (H-h)/2, 2, h);
+            if(side===1) { ctx.fillStyle="rgba(0,0,0,0.3)"; ctx.fillRect(x,(H-h)/2,2,h); }
+        }
+    }
+
+    // --- SPRITE RENDERING ---
+    let renderList = [];
+
+    // Players
+    Object.values(players).forEach(p => {
+        if(p.id !== myId && !p.dead) renderList.push({ type: 'player', obj: p });
+    });
+
+    // Bullets
+    projectiles.forEach(p => {
+        renderList.push({ type: 'bullet', obj: p });
+    });
+
+    // Particles
+    for(let i=particles.length-1; i>=0; i--) {
+        let p = particles[i];
+        p.x += p.vx; p.y += p.vy; 
+        p.z -= 0.02; p.life -= 0.02;
+        if(p.life <= 0 || p.z < -0.5) particles.splice(i, 1);
+        else renderList.push({ type: 'blood', obj: p });
+    }
+
+    renderList.forEach(item => {
+        item.dist = Math.sqrt((item.obj.x-me.x)**2 + (item.obj.y-me.y)**2);
+    });
+    renderList.sort((a,b) => b.dist - a.dist);
+
+    renderList.forEach(item => {
+        let obj = item.obj;
+        let dx = obj.x - me.x; 
+        let dy = obj.y - me.y;
+        
+        let spriteDir = Math.atan2(dy, dx) - localDir;
+        while(spriteDir < -Math.PI) spriteDir += 2*Math.PI;
+        while(spriteDir > Math.PI) spriteDir -= 2*Math.PI;
+
+        if(Math.abs(spriteDir) < 0.7) {
+            let screenX = (0.5 * (spriteDir/0.6) + 0.5) * W;
+            let h = H / item.dist;
+            let center = Math.floor(Math.max(0, Math.min(W-1, screenX)));
+            
+            if(item.dist < ZBuffer[center]) {
+                if(item.type === 'player') {
+                    let w = h / 2;
+                    let img = (obj.team === 'CT') ? ctImg : tImg;
+                    if(img.complete) ctx.drawImage(img, screenX - w/2, (H-h)/2, w, h);
+                    else {
+                        ctx.fillStyle = (obj.team === 'CT') ? '#0af' : '#f00';
+                        ctx.fillRect(screenX - w/2, (H-h)/2, w, h);
+                    }
+                } else if(item.type === 'bullet') {
+                    let size = h / 10;
+                    ctx.fillStyle = '#ff0';
+                    ctx.fillRect(screenX - size/2, H/2 - size/2, size, size);
+                } else if(item.type === 'blood') {
+                    let size = h / 20;
+                    let zOffset = -(obj.z * h); 
+                    ctx.fillStyle = `rgba(200, 0, 0, ${obj.life})`;
+                    ctx.fillRect(screenX - size/2, H/2 + zOffset, size, size);
+                }
+            }
+        }
+    });
+
+    // --- WEAPON ---
+    if(gunRecoil > 0) gunRecoil -= 2;
+    let gunSize = 500;
+    let gunX = W/2 + 200;
+    let gunY = H - gunSize + 150 + gunRecoil; 
+    if(gunImg.complete) ctx.drawImage(gunImg, gunX, gunY, gunSize, gunSize);
+    else { ctx.fillStyle = "#888"; ctx.fillRect(gunX + 100, gunY + 200, 100, 200); }
+}
+draw();
+</script>
+</body>
+</html>
